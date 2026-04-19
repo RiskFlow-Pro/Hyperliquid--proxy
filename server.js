@@ -1,17 +1,16 @@
 // ─── HYPERLIQUID PROXY ───────────────────────────────────────────────────────
 // Deploy su Render (free tier) come gli altri proxy RiskFlow.
-// Firma le richieste autenticate con EIP-712 usando ethers v6.
+// Firma le richieste autenticate con EIP-712 usando ethers v6 + msgpack.
 //
 // Headers attesi dal frontend:
 //   x-hl-key     → private key dell'API Wallet (hex, con o senza 0x)
 //   x-hl-wallet  → indirizzo EVM pubblico dell'account principale (es. 0x...)
-//
-// Il proxy NON logga mai le chiavi. Le usa in-memory solo per la firma.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import express   from 'express';
-import cors      from 'cors';
+import express    from 'express';
+import cors       from 'cors';
 import { ethers } from 'ethers';
+import * as msgpack from '@msgpack/msgpack';
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -25,9 +24,7 @@ app.use(express.json({ limit: '2mb' }));
 // ── Healthcheck ──────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.json({ ok: true, service: 'hl-proxy' }));
 
-// ── /info  — endpoint pubblico, solo relay (no auth) ────────────────────────
-// Il frontend chiama direttamente api.hyperliquid.xyz/info senza CORS issues,
-// ma offriamo comunque /info sul proxy per uniformità e eventuali IP issues.
+// ── /info — endpoint pubblico, solo relay ────────────────────────────────────
 app.post('/info', async (req, res) => {
   try {
     const r = await fetch(HL_INFO, {
@@ -42,11 +39,50 @@ app.post('/info', async (req, res) => {
   }
 });
 
-// ── /exchange — endpoint autenticato, firma EIP-712 ──────────────────────────
-// Il frontend manda il body dell'azione già formato (action + nonce + vaultAddress)
-// e il proxy aggiunge la firma.
+// ── Helpers firma EIP-712 ────────────────────────────────────────────────────
+// Hyperliquid calcola l'actionHash con msgpack encoding dell'action,
+// poi firma un Agent EIP-712 che contiene quell'hash come connectionId.
+// Ref: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/signing
+
+function actionHash(action, vaultAddress, nonce) {
+  // Serializza action + nonce (+ vault se presente) con msgpack
+  const data = vaultAddress
+    ? { ...action, nonce, vaultAddress }
+    : { ...action, nonce };
+
+  const encoded = msgpack.encode(data, { forceIntegerToFloat: false, sortKeys: true });
+  return ethers.keccak256(encoded);
+}
+
+async function signL1Action(signer, action, vaultAddress, nonce) {
+  const hash = actionHash(action, vaultAddress, nonce);
+
+  const domain = {
+    name:              'Exchange',
+    version:           '1',
+    chainId:           1337,
+    verifyingContract: '0x0000000000000000000000000000000000000000',
+  };
+
+  const types = {
+    Agent: [
+      { name: 'source',       type: 'bytes32' },
+      { name: 'connectionId', type: 'bytes32' },
+    ],
+  };
+
+  const value = {
+    source:       ethers.zeroPadValue(ethers.toUtf8Bytes('a'), 32), // 'a' = mainnet
+    connectionId: hash,
+  };
+
+  const signature = await signer.signTypedData(domain, types, value);
+  return ethers.Signature.from(signature);
+}
+
+// ── /exchange — endpoint autenticato ─────────────────────────────────────────
 app.post('/exchange', async (req, res) => {
-  const rawKey    = req.headers['x-hl-key']    || '';
+  const rawKey     = req.headers['x-hl-key']    || '';
   const walletAddr = req.headers['x-hl-wallet'] || '';
 
   if (!rawKey || !walletAddr) {
@@ -57,50 +93,17 @@ app.post('/exchange', async (req, res) => {
     const privateKey = rawKey.startsWith('0x') ? rawKey : '0x' + rawKey;
     const signer     = new ethers.Wallet(privateKey);
 
-    // Verifica che la chiave corrisponda al wallet dichiarato
-    // (opzionale ma utile per debug — non blocca se wallet è subaccount)
-
     const { action, nonce, vaultAddress } = req.body;
     if (!action || nonce === undefined) {
-      return res.status(400).json({ error: 'Body mancante: action, nonce richiesti' });
+      return res.status(400).json({ error: 'Body mancante: action e nonce richiesti' });
     }
 
-    // ── EIP-712 signing ──────────────────────────────────────────────────────
-    // Hyperliquid usa un dominio fisso e una struttura "Agent" per tutte le azioni
-    // Ref: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/signing
-
-    const domain = {
-      name:              'Exchange',
-      version:           '1',
-      chainId:           1337,    // Hyperliquid L1 chain ID
-      verifyingContract: '0x0000000000000000000000000000000000000000',
-    };
-
-    // Hyperliquid firma il payload come hash keccak256 del JSON dell'azione,
-    // poi lo wrappa in un Agent EIP-712
-    const actionHash = ethers.keccak256(
-      ethers.toUtf8Bytes(JSON.stringify(action))
-    );
-
-    const types = {
-      Agent: [
-        { name: 'source',      type: 'bytes32' },
-        { name: 'connectionId', type: 'bytes32' },
-      ],
-    };
-
-    const value = {
-      source:       ethers.zeroPadValue(ethers.toUtf8Bytes('a'), 32), // 'a' = mainnet
-      connectionId: actionHash,
-    };
-
-    const signature = await signer.signTypedData(domain, types, value);
-    const { r, s, v } = ethers.Signature.from(signature);
+    const sig = await signL1Action(signer, action, vaultAddress || null, nonce);
 
     const payload = {
       action,
       nonce,
-      signature: { r, s, v },
+      signature: { r: sig.r, s: sig.s, v: sig.v },
       ...(vaultAddress ? { vaultAddress } : {}),
     };
 
@@ -114,7 +117,7 @@ app.post('/exchange', async (req, res) => {
     res.status(hlRes.status).json(data);
 
   } catch (e) {
-    console.error('[hl-proxy] /exchange error:', e.message);
+    console.error('[hl-proxy] /exchange error:', e.message, e.stack);
     res.status(500).json({ error: e.message });
   }
 });
