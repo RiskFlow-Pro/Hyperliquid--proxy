@@ -1,10 +1,4 @@
 // ─── HYPERLIQUID PROXY ───────────────────────────────────────────────────────
-// Headers attesi dal frontend:
-//   x-hl-key    → private key dell'API Wallet (hex, 66 char con 0x)
-//   x-hl-wallet → indirizzo EVM principale (main wallet)
-//   x-hl-agent  → indirizzo API wallet agente
-// ─────────────────────────────────────────────────────────────────────────────
-
 import express    from 'express';
 import cors       from 'cors';
 import { ethers } from 'ethers';
@@ -35,25 +29,57 @@ app.post('/info', async (req, res) => {
   }
 });
 
-// ── Signing — replica esatta del Python SDK ufficiale ────────────────────────
-// Ref: https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/hyperliquid/utils/signing.py
-//
-// action_hash(action, vault_address, nonce):
-//   data = msgpack.packb(action)
-//   data += nonce.to_bytes(8, "big")
-//   data += b"\x00" se vault_address è None, else b"\x01" + address_bytes
-//   return keccak256(data)
+// ── Replica esatta del Python SDK action_hash ─────────────────────────────────
+// Il Python SDK usa msgpack.packb(action, use_bin_type=True)
+// @msgpack/msgpack di default usa bin per i Buffer, str per le stringhe — ok
+// Il problema può essere nei numeri: il Python SDK usa float_to_wire() che
+// normalizza i float rimuovendo trailing zeros e converte in stringa.
+// Ma per i campi dell'azione che sono già stringhe non c'è problema.
+// Il vero problema: l'ordine dei campi nell'oggetto JS potrebbe variare.
+// Soluzione: ricostruiamo l'oggetto action con ordine deterministico.
+
+function normalizeAction(action) {
+  if (action.type === 'order') {
+    return {
+      type: action.type,
+      orders: action.orders.map(o => {
+        const order = {
+          a: o.a,
+          b: o.b,
+          p: o.p,
+          s: o.s,
+          r: o.r,
+          t: o.t,
+        };
+        return order;
+      }),
+      grouping: action.grouping,
+    };
+  }
+  if (action.type === 'cancel') {
+    return {
+      type: action.type,
+      cancels: action.cancels.map(c => ({ a: c.a, o: c.o })),
+    };
+  }
+  if (action.type === 'updateLeverage') {
+    return {
+      type: action.type,
+      asset: action.asset,
+      isCross: action.isCross,
+      leverage: action.leverage,
+    };
+  }
+  return action;
+}
 
 function buildActionHash(action, vaultAddress, nonce) {
-  // 1. msgpack encode dell'action (solo l'action, senza nonce)
-  const actionBytes = msgpack.encode(action);
+  const normalized = normalizeAction(action);
+  const actionBytes = Buffer.from(msgpack.encode(normalized));
 
-  // 2. nonce come 8 bytes big-endian
   const nonceBuf = Buffer.alloc(8);
-  // nonce è un timestamp ms — usa BigInt per i 64 bit
   nonceBuf.writeBigUInt64BE(BigInt(nonce));
 
-  // 3. vault address bytes
   let vaultBuf;
   if (!vaultAddress) {
     vaultBuf = Buffer.from([0x00]);
@@ -62,7 +88,6 @@ function buildActionHash(action, vaultAddress, nonce) {
     vaultBuf = Buffer.concat([Buffer.from([0x01]), Buffer.from(addrHex, 'hex')]);
   }
 
-  // 4. concatena e keccak256
   const data = Buffer.concat([actionBytes, nonceBuf, vaultBuf]);
   return ethers.keccak256(data);
 }
@@ -77,7 +102,6 @@ async function signL1Action(signer, action, nonce, vaultAddress) {
     verifyingContract: '0x0000000000000000000000000000000000000000',
   };
 
-  // IMPORTANTE: source è type "string" non "bytes32" — come nel Python SDK
   const types = {
     Agent: [
       { name: 'source',       type: 'string'  },
@@ -85,16 +109,12 @@ async function signL1Action(signer, action, nonce, vaultAddress) {
     ],
   };
 
-  const value = {
-    source:       'a', // 'a' = mainnet, 'b' = testnet
-    connectionId,
-  };
+  const value = { source: 'a', connectionId };
 
   const sig = await signer.signTypedData(domain, types, value);
   return ethers.Signature.from(sig);
 }
 
-// ── /exchange ─────────────────────────────────────────────────────────────────
 app.post('/exchange', async (req, res) => {
   const rawKey     = req.headers['x-hl-key']    || '';
   const mainWallet = req.headers['x-hl-wallet'] || '';
