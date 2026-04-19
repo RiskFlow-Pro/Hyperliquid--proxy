@@ -2,7 +2,7 @@
 // Headers attesi dal frontend:
 //   x-hl-key    → private key dell'API Wallet (hex, 66 char con 0x)
 //   x-hl-wallet → indirizzo EVM principale (main wallet)
-//   x-hl-agent  → indirizzo API wallet agente (opzionale, per subaccount)
+//   x-hl-agent  → indirizzo API wallet agente
 // ─────────────────────────────────────────────────────────────────────────────
 
 import express    from 'express';
@@ -35,20 +35,40 @@ app.post('/info', async (req, res) => {
   }
 });
 
-// ── EIP-712 signing ──────────────────────────────────────────────────────────
-// Hyperliquid richiede:
-// 1. msgpack encode di {action, nonce} → keccak256 → connectionId
-// 2. EIP-712 sign di Agent{source, connectionId}
-function buildActionHash(action, nonce, vaultAddress) {
-  const obj = vaultAddress
-    ? { ...action, nonce, vaultAddress }
-    : { ...action, nonce };
-  const encoded = msgpack.encode(obj, { sortKeys: true });
-  return ethers.keccak256(encoded);
+// ── Signing — replica esatta del Python SDK ufficiale ────────────────────────
+// Ref: https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/hyperliquid/utils/signing.py
+//
+// action_hash(action, vault_address, nonce):
+//   data = msgpack.packb(action)
+//   data += nonce.to_bytes(8, "big")
+//   data += b"\x00" se vault_address è None, else b"\x01" + address_bytes
+//   return keccak256(data)
+
+function buildActionHash(action, vaultAddress, nonce) {
+  // 1. msgpack encode dell'action (solo l'action, senza nonce)
+  const actionBytes = msgpack.encode(action);
+
+  // 2. nonce come 8 bytes big-endian
+  const nonceBuf = Buffer.alloc(8);
+  // nonce è un timestamp ms — usa BigInt per i 64 bit
+  nonceBuf.writeBigUInt64BE(BigInt(nonce));
+
+  // 3. vault address bytes
+  let vaultBuf;
+  if (!vaultAddress) {
+    vaultBuf = Buffer.from([0x00]);
+  } else {
+    const addrHex = vaultAddress.toLowerCase().replace('0x', '');
+    vaultBuf = Buffer.concat([Buffer.from([0x01]), Buffer.from(addrHex, 'hex')]);
+  }
+
+  // 4. concatena e keccak256
+  const data = Buffer.concat([actionBytes, nonceBuf, vaultBuf]);
+  return ethers.keccak256(data);
 }
 
 async function signL1Action(signer, action, nonce, vaultAddress) {
-  const connectionId = buildActionHash(action, nonce, vaultAddress);
+  const connectionId = buildActionHash(action, vaultAddress, nonce);
 
   const domain = {
     name:              'Exchange',
@@ -57,15 +77,16 @@ async function signL1Action(signer, action, nonce, vaultAddress) {
     verifyingContract: '0x0000000000000000000000000000000000000000',
   };
 
+  // IMPORTANTE: source è type "string" non "bytes32" — come nel Python SDK
   const types = {
     Agent: [
-      { name: 'source',       type: 'bytes32' },
+      { name: 'source',       type: 'string'  },
       { name: 'connectionId', type: 'bytes32' },
     ],
   };
 
   const value = {
-    source:       ethers.zeroPadValue(ethers.toUtf8Bytes('a'), 32), // 'a' = mainnet
+    source:       'a', // 'a' = mainnet, 'b' = testnet
     connectionId,
   };
 
@@ -73,11 +94,10 @@ async function signL1Action(signer, action, nonce, vaultAddress) {
   return ethers.Signature.from(sig);
 }
 
-// ── /exchange ────────────────────────────────────────────────────────────────
+// ── /exchange ─────────────────────────────────────────────────────────────────
 app.post('/exchange', async (req, res) => {
   const rawKey     = req.headers['x-hl-key']    || '';
   const mainWallet = req.headers['x-hl-wallet'] || '';
-  const agentWallet= req.headers['x-hl-agent']  || '';
 
   if (!rawKey || !mainWallet) {
     return res.status(401).json({ error: 'Mancano x-hl-key o x-hl-wallet' });
@@ -89,7 +109,7 @@ app.post('/exchange', async (req, res) => {
 
     const { action, nonce, vaultAddress } = req.body;
 
-    console.log('[debug] key len:', rawKey.length, '| agent:', agentWallet || 'none');
+    console.log('[debug] signer address:', signer.address);
     console.log('[debug] action:', JSON.stringify(action));
     console.log('[debug] nonce:', nonce);
 
@@ -112,8 +132,11 @@ app.post('/exchange', async (req, res) => {
       body:    JSON.stringify(payload),
     });
 
-    const data = await hlRes.json();
-    console.log('[debug] HL response:', JSON.stringify(data));
+    const text = await hlRes.text();
+    console.log('[debug] HL response:', text);
+
+    let data;
+    try { data = JSON.parse(text); } catch(e) { data = { raw: text }; }
     res.status(hlRes.status).json(data);
 
   } catch (e) {
