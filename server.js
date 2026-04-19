@@ -1,10 +1,8 @@
 // ─── HYPERLIQUID PROXY ───────────────────────────────────────────────────────
-// Deploy su Render (free tier) come gli altri proxy RiskFlow.
-// Firma le richieste autenticate con EIP-712 usando ethers v6 + msgpack.
-//
 // Headers attesi dal frontend:
-//   x-hl-key     → private key dell'API Wallet (hex, con o senza 0x)
-//   x-hl-wallet  → indirizzo EVM pubblico dell'account principale (es. 0x...)
+//   x-hl-key    → private key dell'API Wallet (hex, 66 char con 0x)
+//   x-hl-wallet → indirizzo EVM principale (main wallet)
+//   x-hl-agent  → indirizzo API wallet agente (opzionale, per subaccount)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import express    from 'express';
@@ -21,10 +19,8 @@ const HL_EXCHANGE = 'https://api.hyperliquid.xyz/exchange';
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-// ── Healthcheck ──────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.json({ ok: true, service: 'hl-proxy' }));
 
-// ── /info — endpoint pubblico, solo relay ────────────────────────────────────
 app.post('/info', async (req, res) => {
   try {
     const r = await fetch(HL_INFO, {
@@ -39,23 +35,20 @@ app.post('/info', async (req, res) => {
   }
 });
 
-// ── Helpers firma EIP-712 ────────────────────────────────────────────────────
-// Hyperliquid calcola l'actionHash con msgpack encoding dell'action,
-// poi firma un Agent EIP-712 che contiene quell'hash come connectionId.
-// Ref: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/signing
-
-function actionHash(action, vaultAddress, nonce) {
-  // Serializza action + nonce (+ vault se presente) con msgpack
-  const data = vaultAddress
+// ── EIP-712 signing ──────────────────────────────────────────────────────────
+// Hyperliquid richiede:
+// 1. msgpack encode di {action, nonce} → keccak256 → connectionId
+// 2. EIP-712 sign di Agent{source, connectionId}
+function buildActionHash(action, nonce, vaultAddress) {
+  const obj = vaultAddress
     ? { ...action, nonce, vaultAddress }
     : { ...action, nonce };
-
-  const encoded = msgpack.encode(data, { forceIntegerToFloat: false, sortKeys: true });
+  const encoded = msgpack.encode(obj, { sortKeys: true });
   return ethers.keccak256(encoded);
 }
 
-async function signL1Action(signer, action, vaultAddress, nonce) {
-  const hash = actionHash(action, vaultAddress, nonce);
+async function signL1Action(signer, action, nonce, vaultAddress) {
+  const connectionId = buildActionHash(action, nonce, vaultAddress);
 
   const domain = {
     name:              'Exchange',
@@ -73,19 +66,20 @@ async function signL1Action(signer, action, vaultAddress, nonce) {
 
   const value = {
     source:       ethers.zeroPadValue(ethers.toUtf8Bytes('a'), 32), // 'a' = mainnet
-    connectionId: hash,
+    connectionId,
   };
 
-  const signature = await signer.signTypedData(domain, types, value);
-  return ethers.Signature.from(signature);
+  const sig = await signer.signTypedData(domain, types, value);
+  return ethers.Signature.from(sig);
 }
 
-// ── /exchange — endpoint autenticato ─────────────────────────────────────────
+// ── /exchange ────────────────────────────────────────────────────────────────
 app.post('/exchange', async (req, res) => {
   const rawKey     = req.headers['x-hl-key']    || '';
-  const walletAddr = req.headers['x-hl-wallet'] || '';
+  const mainWallet = req.headers['x-hl-wallet'] || '';
+  const agentWallet= req.headers['x-hl-agent']  || '';
 
-  if (!rawKey || !walletAddr) {
+  if (!rawKey || !mainWallet) {
     return res.status(401).json({ error: 'Mancano x-hl-key o x-hl-wallet' });
   }
 
@@ -94,11 +88,16 @@ app.post('/exchange', async (req, res) => {
     const signer     = new ethers.Wallet(privateKey);
 
     const { action, nonce, vaultAddress } = req.body;
+
+    console.log('[debug] key len:', rawKey.length, '| agent:', agentWallet || 'none');
+    console.log('[debug] action:', JSON.stringify(action));
+    console.log('[debug] nonce:', nonce);
+
     if (!action || nonce === undefined) {
       return res.status(400).json({ error: 'Body mancante: action e nonce richiesti' });
     }
 
-    const sig = await signL1Action(signer, action, vaultAddress || null, nonce);
+    const sig = await signL1Action(signer, action, nonce, vaultAddress || null);
 
     const payload = {
       action,
@@ -114,10 +113,11 @@ app.post('/exchange', async (req, res) => {
     });
 
     const data = await hlRes.json();
+    console.log('[debug] HL response:', JSON.stringify(data));
     res.status(hlRes.status).json(data);
 
   } catch (e) {
-    console.error('[hl-proxy] /exchange error:', e.message, e.stack);
+    console.error('[hl-proxy] /exchange error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
